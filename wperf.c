@@ -1,4 +1,3 @@
-#define _BSD_SOURCE
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdbool.h>
@@ -17,6 +16,8 @@
 #include <netinet/udp.h>
 #include <netinet/ether.h>
 #include <netpacket/packet.h>
+
+#include <pcap/pcap.h>
 
 /* The default server UDP port */
 #define PORT  8888
@@ -113,75 +114,13 @@ struct options {
     unsigned           interval;
     unsigned           mtu;
     int                tid;
-    bool               isserver;
-    bool               isclient;
     bool               issta;
+    bool               random;
+    bool               verbose;
 };
 
 static volatile bool g_report;
-
-static int
-open_monitor(const char *ifname)
-{
-    struct sockaddr_ll ll;
-    int sock;
-
-    memset(&ll, 0, sizeof ll);
-    ll.sll_family = AF_PACKET;
-    ll.sll_ifindex = if_nametoindex(ifname);
-
-    sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-    if (sock < 0) {
-        perror("socket");
-        exit(EXIT_FAILURE);
-    }
-
-    if (bind(sock, (struct sockaddr*)&ll, sizeof ll) < 0) {
-        perror("bind");
-        exit(EXIT_FAILURE);
-    }
-
-    return sock;
-}
-
-static int
-open_udp(int port)
-{
-    struct sockaddr_in sa;
-    int sock;
-
-    sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock < 0) {
-        perror("socket");
-        exit(EXIT_FAILURE);
-    }
-
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(port);
-    sa.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (bind(sock, (struct sockaddr*)&sa, sizeof sa) < 0) {
-        perror("bind");
-        exit(EXIT_FAILURE);
-    }
-
-    return sock;
-}
-
-static void
-connect_udp(int sock, const struct sockaddr_in *peer, struct sockaddr_in *src)
-{
-    socklen_t addrlen = sizeof *src;
-
-    if (connect(sock, (struct sockaddr*)peer, sizeof *peer) < 0) {
-        perror("connect");
-        exit(EXIT_FAILURE);
-    }
-    if (getsockname(sock, (struct sockaddr*)src, &addrlen) < 0) {
-        perror("getsockname");
-        exit(EXIT_FAILURE);
-    }
-}
+static char errbuf[PCAP_ERRBUF_SIZE];
 
 static unsigned
 checksum(unsigned csum, const uint8_t *buf, size_t len)
@@ -514,142 +453,36 @@ safe_usleep(unsigned usec)
     }
 }
 
-static void
-run_server(int sock, bool ismonitor,
-           const struct sockaddr_in *dst, const struct sockaddr_in *src,
-           const struct ether_addr *dhost, const struct ether_addr *shost,
-           const struct ether_addr *bssid, bool tods)
-{
-    struct timeval reported_at;
-    static uint8_t g_buffer[BUFSIZE];
-    static uint32_t rx_window[WINDOW];
-    uint32_t rx_packets = 0;
-    uint32_t rx_drops = 0;
-    uint64_t rx_bytes = 0;
-
-    gettimeofday(&reported_at, NULL);
-
-    for (;;) {
-        uint8_t *buf = g_buffer;
-        uint32_t seq, old;
-        int len;
-
-        /* Receive the next packet */
-        len = recv(sock, g_buffer, sizeof g_buffer, 0);
-
-        /* Handle the report event signal */
-        if (g_report) {
-            struct timeval elapsed;
-            struct timeval now;
-            uint64_t bps;
-            uint32_t usecs;
-            char tmp[2][32];
-
-            g_report = false;
-            gettimeofday(&now, NULL);
-            timersub(&now, &reported_at, &elapsed);
-
-            usecs = 1000000 * elapsed.tv_sec + elapsed.tv_usec;
-            bps = 8000000ULL * rx_bytes / (uint64_t)usecs;
-            round_dec(&elapsed, 2);
-
-            printf("Rx %sB %6u pkts %6u drops (%5.2f%%)"
-                   " in %lu.%02lus rate %sbit/s\n",
-                   print_volume(rx_bytes, tmp[0], sizeof *tmp),
-                   rx_packets, rx_drops,
-                   100.0f * rx_drops / (float)(MAX(rx_packets + rx_drops, 1)),
-                   elapsed.tv_sec, elapsed.tv_usec,
-                   print_volume(bps, tmp[1], sizeof *tmp));
-            reported_at = now;
-            rx_packets = 0;
-            rx_drops = 0;
-            rx_bytes = 0;
-        }
-        if (len < 0) {
-            continue;
-        }
-
-        /* Rip off the Radiotap/802.11/LLC/IP/UDP headers for monitor recv */
-        if (ismonitor) {
-            const struct ether_addr *dh, *sh, *bs;
-            const struct in_addr *da, *sa;
-            in_port_t dp, sp;
-            unsigned proto, etype;
-            size_t bytes;
-            int pos = 0;
-
-            if ((pos = decap_radiotap(buf, pos, len)) < 0) {
-                continue;
-            }
-
-            pos = decap_80211(buf, pos, len, &dh, &sh, &bs, tods);
-            if (pos < 0 ||
-                (dhost && memcmp(dh, dhost, sizeof *dhost) != 0) ||
-                (shost && memcmp(sh, shost, sizeof *shost) != 0) ||
-                (bssid && memcmp(bs, bssid, sizeof *bssid) != 0))
-            {
-                continue;
-            }
-
-            pos = decap_llc(buf, pos, len, &etype);
-            if (pos < 0 || etype != ETHERTYPE_IP) {
-                continue;
-            }
-
-            pos = decap_ip(buf, pos, len, &proto, &bytes, &da, &sa);
-            len = pos + bytes;
-            if (pos < 0 ||
-                proto != IPPROTO_UDP ||
-                (dst && dst->sin_addr.s_addr != htonl(INADDR_ANY) &&
-                 memcmp(da, &dst->sin_addr, sizeof *dst) != 0) ||
-                (src && src->sin_addr.s_addr != htonl(INADDR_ANY) &&
-                 memcmp(sa, &src->sin_addr, sizeof *src) != 0))
-            {
-                continue;
-            }
-
-            pos = decap_udp(buf, pos, len, &bytes, &dp, &sp);
-            len = pos + bytes;
-            if (pos < 0 ||
-                (dst && dst->sin_port != 0 && dst->sin_port != dp) ||
-                (src && src->sin_port != 0 && src->sin_port != sp))
-            {
-                continue;
-            }
-
-            buf += pos;
-            len -= pos;
-        }
-
-        /* The sequence number must fit */
-        if (len < (int)sizeof seq) {
-            continue;
-        }
-
-        /* Account the received packet: record packet loss and discard dups */
-        memcpy(&seq, buf, sizeof seq);
-        seq = ntohl(seq);
-        old = rx_window[seq % WINDOW];
-        rx_window[seq % WINDOW] = seq;
-
-        if (seq == 0) {
-            memset(rx_window, 0, sizeof rx_window);
-        }
-        else if (old != 0 && seq > old) {
-            rx_drops += (seq - old) / WINDOW - 1;
-        }
-        if (seq != old) {
-            rx_packets++;
-            rx_bytes += len + sizeof(struct ip) + sizeof(struct udphdr);
-        }
+static void print_packet(const u_char *packet, unsigned int pkt_length) {
+    fprintf(stderr, "packet: ");
+    for(unsigned int i=0; i < pkt_length; i++) {
+        fprintf(stderr, "%0X", packet[i]);
     }
+    fprintf(stderr, "\n");
 }
 
+static unsigned int g_seed;
+
+//Used to seed the generator.
+static inline void fastrand_init(int seed)
+{
+    g_seed = seed;
+}
+
+//fastrand routine returns one integer, similar output value range as C lib.
+static inline int fastrand()
+{
+    g_seed = (214013*g_seed+2531011);
+    return (g_seed>>16)&0x7FFF;
+}
+
+
+
 static void
-run_client(int sock, bool ismonitor, size_t payload, uint64_t rate,
-           const struct sockaddr_in *dst, const struct sockaddr_in *src,
+run_client(size_t payload, uint64_t rate,
            const struct ether_addr *dhost, const struct ether_addr *shost,
-           const struct ether_addr *bssid, int tid, bool tods)
+           const struct ether_addr *bssid, int tid, bool tods, bool random,
+           bool verbose, pcap_t *pcap)
 {
     struct timeval reported_at;
     struct timeval updated_at;
@@ -660,6 +493,7 @@ run_client(int sock, bool ismonitor, size_t payload, uint64_t rate,
     int64_t error = 0;
     unsigned tick;
 
+    fastrand_init(1000);
     gettimeofday(&reported_at, NULL);
     gettimeofday(&updated_at, NULL);
 
@@ -682,18 +516,40 @@ run_client(int sock, bool ismonitor, size_t payload, uint64_t rate,
         *(uint32_t*)&buf[pos] = htonl(seqnum++);
 
         /* Add Radiotap/802.11/LLC/IP/UDP headers for monitor transmission */
-        if (ismonitor) {
-            pos = encap_udp(buf, pos, len, dst->sin_port, src->sin_port);
-            pos = encap_ip(buf, pos, len, IPPROTO_UDP,
-                           &dst->sin_addr, &src->sin_addr);
-            pos = encap_llc(buf, pos, len, ETHERTYPE_IP);
-            pos = encap_80211(buf, pos, len, dhost, shost, bssid, tid, tods);
-            pos = encap_radiotap(buf, pos, len);
+        #define UDP_SRC_PORT 0xcaf
+        #define UDP_DST_PORT 0xfe0
+        #define IP_SRC_ADDR "10.17.17.1"
+        #define IP_DST_ADDR "10.17.17.254"
+        struct in_addr saddr;
+        struct in_addr daddr;
+
+        inet_pton(AF_INET, IP_SRC_ADDR, &saddr);
+        inet_pton(AF_INET, IP_DST_ADDR, &daddr);
+        unsigned int *uptr = (unsigned int*)&buf[pos];
+
+        if (random) {
+            for(size_t i = 0; i < payload/sizeof(unsigned int); ++i) {
+                *uptr = fastrand();
+                ++uptr;
+            }
         }
+        pos = encap_udp(buf, pos, len, UDP_DST_PORT, UDP_SRC_PORT);
+        pos = encap_ip(buf, pos, len, IPPROTO_UDP,
+                       &daddr, &saddr);
+        pos = encap_llc(buf, pos, len, ETHERTYPE_IP);
+        pos = encap_80211(buf, pos, len, dhost, shost, bssid, tid, tods);
+        pos = encap_radiotap(buf, pos, len);
 
         /* Send the packet */
         do {
-            ret = send(sock, &buf[pos], len - pos, 0);
+            ret = pcap_inject(pcap, &buf[pos], len - pos);
+            if(ret == PCAP_ERROR) {
+                fprintf(stderr, "Error: %s.\n", pcap_geterr(pcap));
+            }
+            if (verbose) {
+                fprintf(stderr, "length %d, ret %d\n", len-pos, ret);
+                print_packet(&buf[pos], len - pos);
+            }
         } while (ret < 0 && errno == EINTR);
 
         /* Account the sent packet, including IP and UDP headers */
@@ -800,13 +656,11 @@ mac_isempty(const struct ether_addr *ea)
 static void
 usage(void)
 {
-    printf("Usage: wperf [-s|-c host] [options]\n"
+    printf("Usage: wperf [options]\n"
            "       wperf [-h|--help]\n"
            "\nOptions:\n"
            "\t-p, --port     <port> server UDP port to listen on/connect to\n"
            "\t-m, --mtu      <mtu>  set the MTU size, default %u\n"
-           "\t-s, --server          run in server mode\n"
-           "\t-c, --client   <host> run in client mode, connecting to <host>\n"
            "\t-b, --bandwidh <bps>  set the bandwidth in [G|M|k]bit/s\n"
            "\t-M, --monitor  <if>   use a monitor interface for send/receive\n"
            "\t-D, --dhost    <mac>  dest MAC address (monitor only)\n"
@@ -815,6 +669,8 @@ usage(void)
            "\t-q, --tid      <tid>  set TID, -1 for non-QoS (monitor only)\n"
            "\t-t, --sta             run as STA instead of AP (monitor only)\n"
            "\t-i, --interval <sec>  set the printout interval (default %us)\n"
+           "\t-r, --radom           random payload\n"
+           "\t-v, --verbose         increase verbosity\n"
            "\t-h, --help            display this help and exit\n",
            MTU, INTERVAL);
 }
@@ -823,8 +679,6 @@ static void
 parse(int argc, char **argv, struct options *data)
 {
     static const struct option opts[] = {
-        {"server",         0, NULL, 's'},
-        {"client",         1, NULL, 'c'},
         {"port",           1, NULL, 'p'},
         {"bandwidth",      1, NULL, 'b'},
         {"mtu",            1, NULL, 'm'},
@@ -832,9 +686,11 @@ parse(int argc, char **argv, struct options *data)
         {"dhost",          1, NULL, 'D'},
         {"shost",          1, NULL, 'S'},
         {"bssid",          1, NULL, 'B'},
-        {"sta",            0, NULL, 't'},
         {"tid",            1, NULL, 'q'},
+        {"sta",            0, NULL, 't'},
         {"interval",       1, NULL, 'i'},
+        {"random",         0, NULL, 'r'},
+        {"verbose",        0, NULL, 'v'},
         {"help",           0, NULL, 'h'},
         {NULL,             0, NULL,   0}
     };
@@ -842,22 +698,9 @@ parse(int argc, char **argv, struct options *data)
     int ch;
 
     while ((ch = getopt_long(argc, argv,
-                             "sc:b:p:m:M:D:S:B:tq:i:h", opts, NULL)) != -1)
+                             "b:p:m:M:D:S:B:tq:i:r:v:h", opts, NULL)) != -1)
     {
         switch (ch) {
-        case 's':
-            data->isserver = true;
-            break;
-
-        case 'c':
-            data->server.sin_addr.s_addr = inet_addr(optarg);
-            data->isclient = true;
-            break;
-
-        case 'p':
-            data->server.sin_port = htons(atoi(optarg));
-            break;
-
         case 'b':
             data->bitrate = parse_rate(optarg);
             break;
@@ -894,6 +737,15 @@ parse(int argc, char **argv, struct options *data)
             data->interval = atoi(optarg);
             break;
 
+        case 'r':
+            data->random = true;
+            break;
+
+        case 'v':
+            data->verbose = true;
+            break;
+
+
         case 'h':
             usage();
             exit(EXIT_SUCCESS);
@@ -908,12 +760,6 @@ parse(int argc, char **argv, struct options *data)
     argv += optind - 1;
 
     data->server.sin_family = AF_INET;
-    if (!data->isserver &&
-        !(data->isclient && data->server.sin_addr.s_addr != 0))
-    {
-        usage();
-        exit(EXIT_FAILURE);
-    }
     if (data->mtu < 4 + sizeof(struct ip) + sizeof(struct udphdr)) {
         fprintf(stderr, "MTU %u is too low\n", data->mtu);
         exit(EXIT_FAILURE);
@@ -925,12 +771,6 @@ parse(int argc, char **argv, struct options *data)
         exit(EXIT_FAILURE);
     }
     if (data->monitor) {
-        if (mac_isempty(&data->dhost) && (data->issta ^ data->isserver)) {
-            data->dhost = data->bssid;
-        }
-        if (mac_isempty(&data->shost) && (data->issta ^ data->isclient)) {
-            data->shost = data->bssid;
-        }
         if (mac_isempty(&data->bssid)) {
             fprintf(stderr, "Monitor mode requires --bssid\n");
             exit(EXIT_FAILURE);
@@ -958,11 +798,13 @@ main(int argc, char **argv)
         .mtu      = MTU,
         .bitrate  = BITRATE,
         .interval = INTERVAL,
+        .random = false,
+        .verbose = false,
     };
 
     int usock = -1;
     int msock = -1;
-    int sock, port, bytes;
+    int bytes;
     struct itimerspec intval;
     struct sigaction sigact;
     struct sigevent sigev;
@@ -971,11 +813,13 @@ main(int argc, char **argv)
     /* Parse arguments */
     parse(argc, argv, &opts);
 
-    /* Create sockets */
-    port = opts.isserver ? htons(opts.server.sin_port) : 0;
-    sock = usock = open_udp(port);
-    if (opts.monitor) {
-        sock = msock = open_monitor(opts.monitor);
+    /* Create pcap interface */
+    pcap_t *pcap;
+    errbuf[0] = '\0';
+    pcap = pcap_open_live(opts.monitor, 80, 1, 0, errbuf);
+    if (pcap == NULL) {
+        fprintf(stderr, "Unable to open interface: %s\n", errbuf);
+        return 1;
     }
 
     /* Set up a sighandler to trigger printouts on SIGRTMIN */
@@ -1003,17 +847,10 @@ main(int argc, char **argv)
 
     /* Start send/receive data */
     bytes = opts.mtu - sizeof(struct ip) - sizeof(struct udphdr);
-    if (opts.isclient) {
-        struct sockaddr_in sa;
-        connect_udp(usock, &opts.server, &sa);
-        run_client(sock, msock >= 0, bytes, MAX(opts.bitrate / 8, 1),
-                   &opts.server, &sa, &opts.dhost, &opts.shost, &opts.bssid,
-                   opts.tid, opts.issta);
-    }
-    else {
-        run_server(sock, msock >= 0, &opts.server, NULL,
-                   &opts.dhost, &opts.shost, &opts.bssid, !opts.issta);
-    }
+
+    run_client(bytes, MAX(opts.bitrate / 8, 1),
+               &opts.dhost, &opts.shost, &opts.bssid,
+               opts.tid, opts.issta, opts.random, opts.verbose, pcap);
 
     /* Cleanup */
     if (usock >= 0) {

@@ -1,5 +1,5 @@
-CFLAGS ?= -O2 -g -Wall -W
-LDLIBS ?= -lrt -pthread
+CFLAGS ?= -O2 -g -Wall -W -Wno-unused-function
+LDLIBS ?= -lrt -lpcap -pthread
 
 wperf: wperf.o
 	$(CC) -o $@ $< $(LDFLAGS) $(LDLIBS)
